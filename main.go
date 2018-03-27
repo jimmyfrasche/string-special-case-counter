@@ -87,7 +87,7 @@ func load(ctx *build.Context, pkgs []string) (*loader.Program, []*loader.Package
 			continue
 		}
 		if !P.TransitivelyErrorFree {
-			log.Print("coult not examine %s_test", pkg)
+			log.Printf("coult not examine %s_test", pkg)
 			continue
 		}
 		acc = append(acc, P)
