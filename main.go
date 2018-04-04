@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -165,17 +166,41 @@ func possibleConversion(call *ast.CallExpr) bool {
 }
 
 type count struct {
-	str2bs int // []byte(string)
-	bs2str int // string([]byte)
-	str2rs int // []rune(string)
-	r2str  int // string(rune)
-	b2str  int // string(byte)
-	append int // append([]byte, string...)
-	copy   int // copy([]byte, string)
-	lloc   int // logical lines of code inspected
+	fs *token.FileSet
+
+	logStr2bs bool
+	str2bs    int // []byte(string)
+
+	logBs2Str bool
+	bs2str    int // string([]byte)
+
+	logStr2rs bool
+	str2rs    int // []rune(string)
+
+	logR2str bool
+	r2str    int // string(rune)
+
+	logB2str bool
+	b2str    int // string(byte)
+
+	logAppend bool
+	append    int // append([]byte, string...)
+
+	logCopy bool
+	copy    int // copy([]byte, string)
+
+	lloc int // logical lines of code inspected
 }
 
-func (c *count) node(pi *loader.PackageInfo, n ast.Node) {
+func (c *count) log(logIt bool, what, imp string, poser interface{ Pos() token.Pos }) {
+	if !logIt {
+		return
+	}
+	pos := c.fs.Position(poser.Pos())
+	log.Printf("%s %s:%s:%d", what, imp, path.Base(pos.Filename), pos.Line)
+}
+
+func (c *count) node(imp string, pi *loader.PackageInfo, n ast.Node) {
 	call, ok := n.(*ast.CallExpr)
 	if !ok {
 		return
@@ -208,8 +233,10 @@ func (c *count) node(pi *loader.PackageInfo, n ast.Node) {
 			}
 
 			if isAppend {
+				c.log(c.logAppend, "append([]byte, string...)", imp, call)
 				c.append++
 			} else {
+				c.log(c.logCopy, "copy([]byte, string)", imp, call)
 				c.copy++
 			}
 			return
@@ -269,20 +296,25 @@ func (c *count) node(pi *loader.PackageInfo, n ast.Node) {
 	case String:
 		switch from {
 		case Byte:
+			c.log(c.logB2str, "string(byte)", imp, call)
 			c.b2str++
 		case Rune:
+			c.log(c.logR2str, "string(rune)", imp, call)
 			c.r2str++
 		case Bytes:
+			c.log(c.logBs2Str, "string([]byte)", imp, call)
 			c.bs2str++
 		}
 
 	case Bytes:
 		if from == String {
+			c.log(c.logStr2bs, "[]byte(string)", imp, call)
 			c.str2bs++
 		}
 
 	case Runes:
 		if from == String {
+			c.log(c.logStr2rs, "[]rune(string)", imp, call)
 			c.str2rs++
 		}
 	}
@@ -327,8 +359,11 @@ func main() {
 	prog, pkgs, err := load(&ctx, imports)
 	chk(err)
 
-	var c count
+	c := count{
+		fs: prog.Fset,
+	}
 	for _, pkg := range pkgs {
+		imp := pkg.Pkg.Path()
 		for _, file := range pkg.Files {
 			lines := lines{
 				fs:   prog.Fset,
@@ -336,7 +371,7 @@ func main() {
 			}
 			ast.Inspect(file, func(n ast.Node) bool {
 				c.lloc += lines.delta(n)
-				c.node(pkg, n)
+				c.node(imp, pkg, n)
 				return true
 			})
 		}
@@ -347,8 +382,8 @@ func main() {
 	fmt.Println("[]rune(string):", c.str2rs)
 	fmt.Println("string(rune):", c.r2str)
 	fmt.Println("string(byte):", c.b2str)
-	fmt.Println("append:", c.append)
-	fmt.Println("copy:", c.copy)
+	fmt.Println("append([]byte, string...):", c.append)
+	fmt.Println("copy([]byte, string):", c.copy)
 	fmt.Println()
 	fmt.Println("packages examined:", len(pkgs))
 	fmt.Println("lloc examined:", c.lloc)
