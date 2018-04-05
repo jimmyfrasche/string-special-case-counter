@@ -43,7 +43,7 @@ func goList(tags, pkgs []string) ([]string, error) {
 	var acc []string
 	for scan.Scan() {
 		name := scan.Text()
-		if !strings.Contains(name+"/", "/vendor/") {
+		if !strings.Contains("/"+name+"/", "/vendor/") {
 			acc = append(acc, name)
 		}
 	}
