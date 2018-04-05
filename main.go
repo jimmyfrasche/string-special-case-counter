@@ -161,8 +161,56 @@ func KindOf(t types.Type) Kind {
 	}
 }
 
-func possibleConversion(call *ast.CallExpr) bool {
-	return len(call.Args) == 1 && call.Ellipsis == token.NoPos
+//isConversion tests whether n is a conversion and returns the type being converted to.
+//This misses a number of cases but covers all that this program cares about.
+func isConversion(pi *loader.PackageInfo, n ast.Node) (types.Type, ast.Expr, bool) {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return nil, nil, false
+	}
+	if len(call.Args) != 1 {
+		return nil, nil, false
+	}
+	if call.Ellipsis != token.NoPos {
+		return nil, nil, false
+	}
+
+	to := pi.Types[call.Fun].Type
+
+	conv := astutil.Unparen(call.Fun)
+
+	// Only interested in the y from x.y and only if x is a package.
+	if se, ok := conv.(*ast.SelectorExpr); ok {
+		if pi.Selections[se] != nil {
+			return nil, nil, false
+		}
+
+		conv = se.Sel
+	}
+
+	switch F := conv.(type) {
+	case *ast.ArrayType, *ast.StarExpr: // NB. StarExpr for weird ones like *(*string)(&x)
+		// Must be a conversion.
+
+	case *ast.Ident:
+		switch to := to.(type) {
+		case *types.Basic:
+			// If this is something we care about, this is string.
+		case *types.Named:
+			// Accept if the name is the same as the same type
+			if to.Obj().Name() != F.Name {
+				return nil, nil, false
+			}
+
+		default:
+			return nil, nil, false
+		}
+
+	default:
+		return nil, nil, false
+	}
+
+	return to, call.Args[0], true
 }
 
 type count struct {
@@ -189,6 +237,12 @@ type count struct {
 	logCopy bool
 	copy    int // copy([]byte, string)
 
+	logRAppend bool
+	rAppend    int // append([]byte, []byte(string)...)
+
+	logRCopy bool
+	rCopy    int // copy([]byte, []byte(string))
+
 	lloc int // logical lines of code inspected
 }
 
@@ -200,6 +254,71 @@ func (c *count) log(logIt bool, what, imp string, poser interface{ Pos() token.P
 	log.Printf("%s %s:%s:%d", what, imp, path.Base(pos.Filename), pos.Line)
 }
 
+func (c *count) builtin(imp string, pi *loader.PackageInfo, call *ast.CallExpr) (counted bool) {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return false
+	}
+
+	bi, ok := pi.Uses[id]
+	if !ok {
+		return false
+	}
+
+	// Determine if this is copy or an append we're interested in.
+	isAppend := false
+	switch bi.Name() {
+	case "append":
+		// Only want append(X, Y...).
+		if len(call.Args) != 2 || call.Ellipsis == token.NoPos {
+			return
+		}
+		isAppend = true
+
+	case "copy":
+
+	default:
+		return false
+	}
+	// In either case,  need arg₀ = []byte, arg₁ = string or []byte(string).
+	if KindOf(pi.Types[call.Args[0]].Type) != Bytes {
+		return false
+	}
+
+	k := KindOf(pi.Types[call.Args[1]].Type)
+	if k == Bytes {
+		// count redundant []byte(string)
+		_, arg, ok := isConversion(pi, call.Args[1])
+		if !ok {
+			return false
+		}
+		if KindOf(pi.Types[arg].Type) != String {
+			return false
+		}
+
+		if isAppend {
+			c.log(c.logRAppend, "append([]byte, []byte(string)...)", imp, call)
+			c.rAppend++
+		} else {
+			c.log(c.logRCopy, "copy([]byte, []byte(string))", imp, call)
+			c.rCopy++
+		}
+		return true
+	}
+	if k != String {
+		return false
+	}
+
+	if isAppend {
+		c.log(c.logAppend, "append([]byte, string...)", imp, call)
+		c.append++
+	} else {
+		c.log(c.logCopy, "copy([]byte, string)", imp, call)
+		c.copy++
+	}
+	return true
+}
+
 func (c *count) node(imp string, pi *loader.PackageInfo, n ast.Node) {
 	call, ok := n.(*ast.CallExpr)
 	if !ok {
@@ -207,91 +326,25 @@ func (c *count) node(imp string, pi *loader.PackageInfo, n ast.Node) {
 	}
 
 	// Test for builtins.
-	if id, ok := call.Fun.(*ast.Ident); ok { // TODO: move this into own func?
-		if bi, ok := pi.Uses[id].(*types.Builtin); ok {
-			isAppend := false
-			switch bi.Name() {
-			case "append":
-				// Only want append([]byte, string...).
-				if len(call.Args) != 2 || call.Ellipsis == token.NoPos {
-					return
-				}
-				isAppend = true
-
-			case "copy":
-
-			default:
-				return
-			}
-
-			// In either case,  need arg₀ = []byte, arg₁ = string.
-			if KindOf(pi.Types[call.Args[0]].Type) != Bytes {
-				return
-			}
-			if KindOf(pi.Types[call.Args[1]].Type) != String {
-				return
-			}
-
-			if isAppend {
-				c.log(c.logAppend, "append([]byte, string...)", imp, call)
-				c.append++
-			} else {
-				c.log(c.logCopy, "copy([]byte, string)", imp, call)
-				c.copy++
-			}
-			return
-		}
-	}
-
-	if !possibleConversion(call) {
+	if c.builtin(imp, pi, call) {
 		return
 	}
 
-	from := KindOf(pi.Types[call.Args[0]].Type)
-
-	// If this is a conversion, it's not one we are interested in.
-	if from == Other {
+	toType, _, ok := isConversion(pi, call)
+	if !ok {
 		return
 	}
 
-	convType := pi.Types[call.Fun].Type
-	to := KindOf(convType)
+	to := KindOf(toType)
 	if to == Other {
 		return
 	}
 
-	// Grab the conv part from conv(X).
-	conv := astutil.Unparen(call.Fun)
-	if se, ok := conv.(*ast.SelectorExpr); ok {
-		if pi.Selections[se] != nil {
-			// Definitely not a conversion.
-			return
-		}
-		conv = se.Sel
+	from := KindOf(pi.Types[call.Args[0]].Type)
+	if from == Other {
+		return
 	}
 
-	// We know we have a type we're interested in,
-	// but not whether the current expression is definitely a conversion yet.
-	switch F := conv.(type) {
-	case *ast.ArrayType, *ast.StarExpr: // NB. StarExpr for weird ones like *(*string)(&x)
-		// Must be a conversion.
-	case *ast.Ident:
-		switch convType := convType.(type) {
-		case *types.Named:
-			// Accept if type name == conv
-			if convType.Obj().Name() != F.Name {
-				return
-			}
-
-		case *types.Basic:
-			// Must be a string.
-
-		default:
-			return
-		}
-	}
-
-	// If we found a conversion we're interested in, count it.
 	switch to {
 	case String:
 		switch from {
@@ -360,7 +413,9 @@ func main() {
 	chk(err)
 
 	c := count{
-		fs: prog.Fset,
+		fs:         prog.Fset,
+		logRAppend: true,
+		logRCopy:   true,
 	}
 	for _, pkg := range pkgs {
 		imp := pkg.Pkg.Path()
@@ -380,10 +435,15 @@ func main() {
 	fmt.Println("[]byte(string):", c.str2bs)
 	fmt.Println("string([]byte):", c.bs2str)
 	fmt.Println("[]rune(string):", c.str2rs)
+	fmt.Println()
 	fmt.Println("string(rune):", c.r2str)
 	fmt.Println("string(byte):", c.b2str)
+	fmt.Println()
 	fmt.Println("append([]byte, string...):", c.append)
 	fmt.Println("copy([]byte, string):", c.copy)
+	fmt.Println()
+	fmt.Println("append([]byte, []byte(string)...):", c.rAppend)
+	fmt.Println("copy([]byte, []byte(string)):", c.rCopy)
 	fmt.Println()
 	fmt.Println("packages examined:", len(pkgs))
 	fmt.Println("lloc examined:", c.lloc)

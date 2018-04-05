@@ -9,7 +9,7 @@ func f() {
 	var b byte
 	var r rune
 
-	// 4
+	// 8 (4 extra from last 4 cases for redudundant conversions)
 	_ = []byte(s)
 	_ = []byte(p.String(s))
 	_ = p.Bytes(s)
@@ -48,4 +48,12 @@ func f() {
 	// 2
 	copy(bs, s)
 	copy(p.Bytes(bs), p.String(s))
+
+	// 2
+	_ = append(bs, []byte(s)...)
+	_ = append(bs, []byte(p.String(s))...)
+
+	// 2
+	copy(bs, []byte(s))
+	copy(bs, []byte(p.String(s)))
 }
